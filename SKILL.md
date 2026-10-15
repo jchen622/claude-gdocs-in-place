@@ -1,6 +1,6 @@
 ---
 name: gdocs-in-place
-description: Edit a Google Drive document, deck or spreadsheet in place on its existing file id, preserving comment threads, tracked changes and share links. Use whenever changing a file that lives on Drive, especially one under author review, and above all when a local build pipeline generates it - rebuilding and re-uploading destroys every comment. Provides tracked-change tooling and a pre-push verification gate.
+description: Edit a stored .docx on Google Drive in place on its existing file id, preserving comment threads and tracked changes, with tracked-change tooling and a pre-push verification gate. Use when changing a Drive-hosted .docx, especially one under author review, and above all when a local build pipeline generates it - rebuilding and re-uploading destroys every comment. Also carries the in-place rule for Drive generally; for native Google Slides use the gslides skill, for native Google Sheets use gsheets, for native Google Docs use gdocs.
 ---
 
 # Editing Drive files in place
@@ -11,6 +11,24 @@ The id carries everything that is not text: comment threads and their replies, @
 the notifications they send, resolution state, the share list, and every link anyone has pasted
 into Slack, email or another document. Replacing the file destroys all of it, and the text can
 look perfect while it happens.
+
+## Which skill to use, by file type
+
+**This skill handles a stored `.docx` on Drive.** Native Google files are a different thing
+entirely: they have no OOXML to edit, and their comments live in Drive's comment layer rather
+than inside the file. Each has its own working path, already built:
+
+| File | Use | Why not this skill |
+|---|---|---|
+| Stored `.docx` | **this skill** | - |
+| Native Google Slides | **`gslides`** (Apps Script bridge) | the Slides REST API needs a quota project and is unavailable here; a `.pptx` round trip corrupts Material Icons |
+| Native Google Sheets | **`gsheets`** (Sheets API) | values and ranges, not OOXML |
+| Native Google Doc | **`gdocs`** | Docs API, not OOXML |
+
+`drive_io.py` will refuse a native file rather than let you treat it as an archive.
+
+All of them edit in place on the existing id. **The rule below is Drive-wide; only the tooling
+in this skill is `.docx`-specific.**
 
 ## When this matters most
 
@@ -92,11 +110,6 @@ When you hit either refusal, say so and leave the content alone rather than work
   status; if you call the API by hand, check it yourself and re-verify on Drive.
 - **Google-native files** (Docs, Sheets, Slides proper) must be exported with
   `/export?mimeType=...`; `alt=media` fails on them. `drive_io.py stat` tells you which you have.
-
-## Google Slides
-
-**Never round-trip a deck through `.pptx`.** It destroys Material Icons. Use the native path.
-For reading or exporting a deck without changing it, the `gdrive` skill is enough.
 
 ## Before you push, ask
 

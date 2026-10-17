@@ -19,14 +19,16 @@ native Google Doc, not a stored `.docx`.** This is a decision made once, at crea
 cannot be undone cheaply later: converting produces a **new file id**, which is exactly what the
 in-place rule exists to protect.
 
-The reason is measured, not theoretical. On the same Drive account, same org:
+The reason is measured on purpose-built throwaway documents, resolving through the Docs UI in
+both cases, not inferred:
 
 | | Stored `.docx` | Native Google Doc |
 |---|---|---|
-| Resolve a comment | **deleted from the file** | kept, `resolved: true` |
-| Author and text afterwards | **stripped** | intact |
-| Replies afterwards | **gone** | intact |
-| Visible in comment history | **no** | yes, permanently |
+| Resolve a comment | **deleted from the file**, 3 comments become 2 | kept, `resolved: true` |
+| Author and text afterwards | **stripped** from Drive's tombstone | intact |
+| Replies afterwards | **gone** | intact, including the resolution reply |
+| Visible in comment history | **no** | yes, under a "Resolved" heading |
+| Survives a later edit | n/a, already gone | yes |
 
 On a stored `.docx`, resolving is recorded as a *deletion*. Drive's comment layer keeps a
 tombstone row with `author: null` and empty content, and the file loses the comment outright. One
@@ -123,11 +125,11 @@ When you hit either refusal, say so and leave the content alone rather than work
 
 - **Google Docs renumbers comment ids on save.** Ten comments with ids 0,1,2,5,7,11,15,20,21,23
   came back as 0 to 8. Never key anything on comment id. Match on author plus text.
-- **Resolving a comment deletes it** from a stored `.docx`. There *is* a resolved flag in the
-  format, `w15:done` in `word/commentsExtended.xml`, and Google never writes it: every surviving
-  comment reads `done="0"`. A drop in count is therefore normal and is **not** recoverable from
-  the file. See "Resolved comments are destroyed" below; this is the single most expensive
-  behaviour on this list.
+- **Resolving a comment deletes it** from a stored `.docx`, measured on throwaway files rather
+  than inferred: a document with three open comments, one resolved in the Docs UI, comes back
+  with **two**, and no `w15:done="1"` is written. A drop in count is therefore normal and is
+  **not** recoverable from the file. See "Resolved comments are destroyed" below; this is the
+  single most expensive behaviour on this list.
 - **The Drive comments API does work on a stored `.docx`.** An earlier version of this file
   claimed it returns nothing. It does not: `files/<id>/comments?includeDeleted=true` returns the
   threads, and it holds **replies that never appear in the OOXML at all**, so archive both
@@ -154,6 +156,21 @@ thread it is gone from the file, and Drive's tombstone keeps no author and no te
 this tooling causes that**: `rewrite()` replaces `word/document.xml` and copies every other zip
 entry byte-identical, and `verify_edit.py` fails any push whose comment set differs. A drop
 between two pulls is always a human resolving one.
+
+### Do not try to fix this by writing `w15:done="1"`
+
+It looks like it works, and it does not. Measured on disposable Drive files:
+
+| Test | Result |
+|---|---|
+| Upload a `.docx` with `w15:done="1"` on one comment | Docs **renders it** under a "Resolved" heading, author and text intact |
+| Resolve a comment in the Docs UI on a `.docx` | comment is **deleted** from the file; no `done` flag written |
+| Then re-read the file | the hand-set `done="1"` comment is **also gone** |
+| Same resolve on a **native Google Doc** | `resolved: true`, `deleted: false`, text and replies intact, survives later edits |
+
+So Docs *reads* the flag and never *writes* it, and its next save of the file discards every
+resolved comment including ones flagged by hand. Re-injecting resolved comments therefore buys
+one page load, not persistence. The only durable answer is the native Google Doc above.
 
 What the tooling does instead is capture:
 

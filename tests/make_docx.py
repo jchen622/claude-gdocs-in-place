@@ -63,6 +63,15 @@ def build(path: str, done_index: int | None = None) -> None:
             f'<w:r><w:t xml:space="preserve"> and then continues to the end of the line.'
             f'</w:t></w:r>'
             f'</w:p>')
+    # A tracked insertion and a tracked deletion, to test what conversion does to review markup.
+    paras.append(
+        '<w:p><w:r><w:t xml:space="preserve">Tracked markup follows: </w:t></w:r>'
+        '<w:ins w:id="900" w:author="Carol Reviewer" w:date="2026-10-17T12:00:00Z">'
+        '<w:r><w:t xml:space="preserve">this phrase was inserted</w:t></w:r></w:ins>'
+        '<w:r><w:t xml:space="preserve"> and </w:t></w:r>'
+        '<w:del w:id="901" w:author="Carol Reviewer" w:date="2026-10-17T12:00:00Z">'
+        '<w:r><w:delText xml:space="preserve">this phrase was deleted</w:delText></w:r></w:del>'
+        '<w:r><w:t xml:space="preserve"> at the end.</w:t></w:r></w:p>')
     document = (f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
                 f'<w:document {NS}><w:body>{"".join(paras)}'
                 f'<w:sectPr><w:pgSz w:w="12240" w:h="15840"/></w:sectPr>'

@@ -38,6 +38,28 @@ recoverable because Drive still held un-purged revisions.
 So: native Doc for anything under review. Reach for this skill's `.docx` tooling when the file is
 already a `.docx` and converting would cost an id people have linked to.
 
+### Converting an existing `.docx`, and what it costs
+
+**There is no in-place conversion.** Both routes were tried and neither changes the mimeType of
+an existing file: `PATCH /files/<id>` with a new `mimeType` is accepted and silently ignored,
+returning the old type, and `PATCH /upload/files/<id>?uploadType=media` with the Docs mimeType
+fails `HTTP 400 Invalid MIME type provided for the uploaded content`. Conversion only happens on
+ingest, via `files.copy` with `mimeType` set or a fresh upload, and both mint a **new file id**.
+
+What a converting copy keeps and loses, measured:
+
+| | Survives? |
+|---|---|
+| Comments, with their authors | **yes**, all of them |
+| Comment anchors | **yes**, 3 of 3, even though `quotedFileContent` reports empty over the API |
+| Tracked insertions and deletions | **yes**, accept and reject views both correct |
+| The file id, so existing links keep working | **no** |
+| The share list | **no**: a source shared to a whole domain copied to owner-only |
+| Comments already deleted by an earlier resolve | **no**, those are gone regardless |
+
+So the content survives conversion intact; what you pay is the id and re-sharing with every
+collaborator. Decide this at creation, not mid-review.
+
 ## Which skill to use, by file type
 
 **This skill handles a stored `.docx` on Drive.** Native Google files are a different thing

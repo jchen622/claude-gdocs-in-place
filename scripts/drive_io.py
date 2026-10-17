@@ -187,17 +187,24 @@ def load_ledger(fid: str) -> dict:
     return {'fileId': fid, 'pulls': [], 'comments': {}}
 
 
-def update_ledger(fid: str, meta: dict, seen: list[dict]) -> list[dict]:
-    """Fold this pull's comments into the append-only ledger. Returns what has gone missing
-    since the previous pull, which is the whole reason this exists."""
+def update_ledger(fid: str, meta: dict, seen: list[dict]) -> dict:
+    """Fold this pull's comments into the append-only ledger, and report what has gone.
+
+    **Per source, not pooled.** Resolving a comment removes it from the .docx while Drive's
+    comment layer often still returns it, so a union of the two hides exactly the event this
+    exists to catch. One document had 15 comments deleted from the file and still live in the
+    API; comparing the union reported nothing missing. Compare each source against itself.
+    """
     led = load_ledger(fid)
     now = meta.get('modifiedTime')
-    prev_keys = set(led['pulls'][-1]['keys']) if led['pulls'] else set()
+    last = led['pulls'][-1] if led['pulls'] else {}
+    prev = {'ooxml': set(last.get('docx_keys', [])),
+            'drive': set(last.get('drive_keys', []))}
 
-    keys = []
+    cur = {'ooxml': set(), 'drive': set()}
     for c in seen:
         k = _key(c['author'], c['text'])
-        keys.append(k)
+        cur.setdefault(c.get('source', 'ooxml'), set()).add(k)
         rec = led['comments'].get(k)
         if rec is None:
             led['comments'][k] = dict(c, firstSeen=now, lastSeen=now)
@@ -208,12 +215,25 @@ def update_ledger(fid: str, meta: dict, seen: list[dict]) -> list[dict]:
             if c.get('replies'):
                 rec['replies'] = c['replies']
 
-    gone = [led['comments'][k] for k in prev_keys - set(keys) if k in led['comments']]
+    def expand(keys):
+        return [led['comments'][k] for k in keys if k in led['comments']]
+
+    out = {
+        'from_document': expand(prev['ooxml'] - cur['ooxml']),
+        'from_drive_layer': expand(prev['drive'] - cur['drive']),
+    }
+    # Everything no longer in either source: the genuinely unrecoverable set.
+    both = (prev['ooxml'] | prev['drive']) - (cur['ooxml'] | cur['drive'])
+    out['from_both'] = expand(both)
+
     led['pulls'].append({'modifiedTime': now, 'name': meta.get('name'),
-                         'count': len(set(keys)), 'keys': sorted(set(keys))})
+                         'count': len(cur['ooxml'] | cur['drive']),
+                         'docx_keys': sorted(cur['ooxml']),
+                         'drive_keys': sorted(cur['drive']),
+                         'keys': sorted(cur['ooxml'] | cur['drive'])})
     led['name'] = meta.get('name')
     _ledger_path(fid).write_text(json.dumps(led, indent=1))
-    return gone
+    return out
 
 
 # --------------------------------------------------------------------------- verbs
@@ -244,9 +264,13 @@ def pull(fid: str, out: str) -> dict:
         gone = update_ledger(fid, meta, seen)
         meta['comments_archived'] = len(seen)
         meta['ledger'] = str(_ledger_path(fid))
-        if gone:
-            meta['resolved_since_last_pull'] = [
-                {'author': g['author'], 'text': g['text'][:160]} for g in gone]
+        label = {'from_document': 'resolved_since_last_pull_gone_from_document',
+                 'from_drive_layer': 'gone_from_drive_comment_layer',
+                 'from_both': 'gone_from_both_sources'}
+        for k, items in gone.items():
+            if items:
+                meta[label[k]] = [{'author': g['author'], 'text': g['text'][:160]}
+                                  for g in items]
     return meta
 
 
@@ -323,9 +347,17 @@ def lost(fid: str) -> dict:
     led = load_ledger(fid)
     if not led.get('pulls'):
         return {'error': 'no ledger yet for this file; run pull first'}
-    cur = set(led['pulls'][-1]['keys'])
+    last = led['pulls'][-1]
+    cur = set(last['keys'])
+    in_docx = set(last.get('docx_keys', []))
     gone = [v for k, v in led['comments'].items() if k not in cur]
+    # Visible in neither the file nor the Docs UI, but still returned by the Drive API.
+    hidden = [led['comments'][k] for k in cur - in_docx if k in led['comments']] \
+        if last.get('docx_keys') else []
     return {'ever_seen': len(led['comments']), 'current': len(cur), 'lost': len(gone),
+            'gone_from_document_but_live_in_drive_layer': len(hidden),
+            'hidden': sorted(({'author': g['author'], 'text': g['text'][:120]} for g in hidden),
+                             key=lambda g: (g['author'], g['text'])),
             'comments': sorted(({'author': g['author'], 'text': g['text'],
                                  'anchor': g.get('anchor', ''), 'lastSeen': g.get('lastSeen')}
                                 for g in gone), key=lambda g: (g['author'], g['text']))}

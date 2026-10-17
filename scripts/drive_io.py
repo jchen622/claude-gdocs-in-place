@@ -2,31 +2,47 @@
 """Pull and push a Drive file by id, without ever changing the id.
 
     python3 drive_io.py pull <file_id> <out_path>
-    python3 drive_io.py push <file_id> <in_path>
+    python3 drive_io.py push <file_id> <in_path> [--expect <modifiedTime> | --force]
     python3 drive_io.py stat <file_id>
+    python3 drive_io.py pin  <file_id>
+    python3 drive_io.py lost <file_id>
 
 The id is the whole point. It carries the comment threads, their replies, the @-mentions and
 the notifications they send, the resolution state, the share list, and every link anyone has
 pasted into Slack or email. `push` is a media PATCH onto the existing id, so all of that
 survives. There is deliberately no "create" verb here.
 
-Two failure modes this wraps, both of which have cost real work:
+Four failure modes this wraps, all of which have cost real work:
 
   * **A push can fail silently.** `gcloud auth print-access-token` returns a short-lived token.
     When it expires mid-session the API returns an empty body, curl exits 0, and the next step
     happily reports success against a file that was never written. Every call here checks the
     HTTP status and raises.
+  * **A push built on a stale pull silently reverts the author's work.** `push` refuses when the
+    file moved on Drive after the pull this build came from, unless you pass --force. Without
+    this guard a push once restored a deleted sentence and resurrected two resolved comments.
+  * **Resolving a comment destroys it.** On a stored .docx, Google records a resolve as a
+    *deletion*: the comment vanishes from the file, and Drive's comment layer keeps the row but
+    strips the author and the content. So `pull` archives every comment it sees, from both
+    sources, into an append-only ledger, and reports anything that has gone since last time.
   * **Google-native files are not binary.** Docs, Sheets and Slides must be exported via
     `/export?mimeType=...`; `alt=media` fails on them. A stored .docx/.pptx uploaded to Drive is
     binary and uses `alt=media`. `stat` prints the mimeType so you can tell which you have.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import pathlib
+import re
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
+import zipfile
+import xml.etree.ElementTree as ET
 
 API = 'https://www.googleapis.com/drive/v3/files'
 UPLOAD = 'https://www.googleapis.com/upload/drive/v3/files'
@@ -35,6 +51,10 @@ PPTX = 'application/vnd.openxmlformats-officedocument.presentationml.presentatio
 NATIVE = {'application/vnd.google-apps.document',
           'application/vnd.google-apps.presentation',
           'application/vnd.google-apps.spreadsheet'}
+W = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+
+LEDGER_DIR = pathlib.Path(
+    os.environ.get('GDOCS_LEDGER_DIR', pathlib.Path.home() / '.gdocs-in-place' / 'ledger'))
 
 
 def token() -> str:
@@ -66,6 +86,138 @@ def stat(fid: str) -> dict:
     return json.loads(body)
 
 
+# --------------------------------------------------------------------------- comment archiving
+
+def _norm(s: str) -> str:
+    return re.sub(r'\s+', ' ', s or '').strip()
+
+
+def _key(author: str, text: str) -> str:
+    """Identity of a comment. Never its id: Google renumbers ids on every save."""
+    return hashlib.sha1(f'{author}\x00{text}'.encode('utf-8')).hexdigest()[:16]
+
+
+def docx_comments(path: str) -> list[dict]:
+    """Comments inside the .docx itself, with their anchor text and reply/top-level status."""
+    z = zipfile.ZipFile(path)
+    if 'word/comments.xml' not in z.namelist():
+        return []
+    w14 = '{http://schemas.microsoft.com/office/word/2010/wordml}'
+    w15 = '{http://schemas.microsoft.com/office/word/2012/wordml}'
+
+    croot = ET.fromstring(z.read('word/comments.xml'))
+    by_id, para_of = {}, {}
+    for c in croot.iter(W + 'comment'):
+        cid = c.get(W + 'id')
+        by_id[cid] = {'author': c.get(W + 'author') or '?',
+                      'date': c.get(W + 'date'),
+                      'text': _norm(''.join(t.text or '' for t in c.iter(W + 't')))}
+        for p in c.iter(W + 'p'):
+            if p.get(w14 + 'paraId'):
+                para_of[p.get(w14 + 'paraId')] = cid
+
+    reply_of = {}
+    if 'word/commentsExtended.xml' in z.namelist():
+        ex = ET.fromstring(z.read('word/commentsExtended.xml'))
+        for e in ex.iter(w15 + 'commentEx'):
+            cid = para_of.get(e.get(w15 + 'paraId'))
+            if cid:
+                reply_of[cid] = bool(e.get(w15 + 'paraIdParent'))
+
+    # anchor text per comment id
+    droot = ET.fromstring(z.read('word/document.xml'))
+    cur, spans = {}, {}
+    for el in droot.iter():
+        if el.tag == W + 'commentRangeStart':
+            cur[el.get(W + 'id')] = []
+        elif el.tag == W + 'commentRangeEnd':
+            spans[el.get(W + 'id')] = _norm(''.join(cur.pop(el.get(W + 'id'), [])))
+        elif el.tag in (W + 't', W + 'delText'):
+            for buf in cur.values():
+                buf.append(el.text or '')
+
+    return [{'source': 'ooxml', 'author': v['author'], 'text': v['text'],
+             'date': v['date'], 'anchor': spans.get(k, ''), 'isReply': reply_of.get(k, False)}
+            for k, v in by_id.items()]
+
+
+def drive_comments(fid: str) -> list[dict]:
+    """Drive's own comment layer. A second, independent source: it holds replies that the OOXML
+    does not. Deleted comments come back tombstoned, author and content stripped, so this cannot
+    recover anything already resolved. Archive it for what is still live."""
+    fields = ('comments(id,createdTime,author/displayName,content,resolved,deleted,'
+              'quotedFileContent/value,replies(id,createdTime,author/displayName,content,'
+              'deleted)),nextPageToken')
+    out, page = [], None
+    while True:
+        q = {'includeDeleted': 'true', 'pageSize': '100', 'fields': fields}
+        if page:
+            q['pageToken'] = page
+        _, body = _request(f'{API}/{fid}/comments?' + urllib.parse.urlencode(q))
+        d = json.loads(body)
+        for c in d.get('comments', []):
+            if c.get('deleted') or not _norm(c.get('content', '')):
+                continue          # tombstone: no author, no content, nothing to archive
+            out.append({'source': 'drive',
+                        'author': (c.get('author') or {}).get('displayName') or '?',
+                        'text': _norm(c.get('content')),
+                        'date': c.get('createdTime'),
+                        'anchor': _norm((c.get('quotedFileContent') or {}).get('value', '')),
+                        'isReply': False,
+                        'replies': [{'author': (r.get('author') or {}).get('displayName') or '?',
+                                     'text': _norm(r.get('content')),
+                                     'date': r.get('createdTime')}
+                                    for r in c.get('replies', [])
+                                    if _norm(r.get('content'))]})
+        page = d.get('nextPageToken')
+        if not page:
+            break
+    return out
+
+
+def _ledger_path(fid: str) -> pathlib.Path:
+    LEDGER_DIR.mkdir(parents=True, exist_ok=True)
+    return LEDGER_DIR / f'{fid}.json'
+
+
+def load_ledger(fid: str) -> dict:
+    p = _ledger_path(fid)
+    if p.exists():
+        return json.loads(p.read_text())
+    return {'fileId': fid, 'pulls': [], 'comments': {}}
+
+
+def update_ledger(fid: str, meta: dict, seen: list[dict]) -> list[dict]:
+    """Fold this pull's comments into the append-only ledger. Returns what has gone missing
+    since the previous pull, which is the whole reason this exists."""
+    led = load_ledger(fid)
+    now = meta.get('modifiedTime')
+    prev_keys = set(led['pulls'][-1]['keys']) if led['pulls'] else set()
+
+    keys = []
+    for c in seen:
+        k = _key(c['author'], c['text'])
+        keys.append(k)
+        rec = led['comments'].get(k)
+        if rec is None:
+            led['comments'][k] = dict(c, firstSeen=now, lastSeen=now)
+        else:
+            rec['lastSeen'] = now
+            if c.get('anchor') and not rec.get('anchor'):
+                rec['anchor'] = c['anchor']
+            if c.get('replies'):
+                rec['replies'] = c['replies']
+
+    gone = [led['comments'][k] for k in prev_keys - set(keys) if k in led['comments']]
+    led['pulls'].append({'modifiedTime': now, 'name': meta.get('name'),
+                         'count': len(set(keys)), 'keys': sorted(set(keys))})
+    led['name'] = meta.get('name')
+    _ledger_path(fid).write_text(json.dumps(led, indent=1))
+    return gone
+
+
+# --------------------------------------------------------------------------- verbs
+
 def pull(fid: str, out: str) -> dict:
     meta = stat(fid)
     if meta['mimeType'] in NATIVE:
@@ -76,11 +228,43 @@ def pull(fid: str, out: str) -> dict:
     with open(out, 'wb') as fh:
         fh.write(blob)
     meta['bytes_written'] = len(blob)
+
+    seen = []
+    if out.endswith('.docx'):
+        try:
+            seen += docx_comments(out)
+        except Exception as e:                       # never let archiving break a pull
+            meta['comment_archive_error'] = str(e)[:200]
+    try:
+        seen += drive_comments(fid)
+    except SystemExit as e:
+        meta['drive_comment_error'] = str(e)[:200]
+
+    if seen:
+        gone = update_ledger(fid, meta, seen)
+        meta['comments_archived'] = len(seen)
+        meta['ledger'] = str(_ledger_path(fid))
+        if gone:
+            meta['resolved_since_last_pull'] = [
+                {'author': g['author'], 'text': g['text'][:160]} for g in gone]
     return meta
 
 
-def push(fid: str, path: str) -> dict:
+def push(fid: str, path: str, expect: str | None = None, force: bool = False) -> dict:
     before = stat(fid)
+    if not force:
+        want = expect
+        if want is None:
+            led = load_ledger(fid)
+            want = led['pulls'][-1]['modifiedTime'] if led.get('pulls') else None
+        if want and want != before.get('modifiedTime'):
+            raise SystemExit(
+                'REFUSING TO PUSH: Drive moved since the pull this build came from.\n'
+                f'  build is based on : {want}\n'
+                f'  Drive now has     : {before.get("modifiedTime")} '
+                f'(last edited by {(before.get("lastModifyingUser") or {}).get("displayName","?")})\n'
+                'Pushing would revert their edits. Discard this build, pull again, redo the edit.\n'
+                'Override with --force only if you are certain nothing was lost.')
     ctype = PPTX if path.endswith('.pptx') else DOCX
     with open(path, 'rb') as fh:
         blob = fh.read()
@@ -94,19 +278,78 @@ def push(fid: str, path: str) -> dict:
     return after
 
 
+def pin(fid: str) -> dict:
+    """Set keepForever on every revision of the file.
+
+    Revision history is the only way back to a comment somebody resolved, so pin early.
+
+    Pinning also *restores access*. An unpinned revision older than about 30 days returns
+    HTTP 403 on download, which looks exactly like the content having been purged. It has not
+    been: pin it and the same revision downloads fine. Never read a 403 here as proof of loss.
+    On the document this was built for, 32 revisions returned 403 and pinning brought all of
+    them back, taking the recoverable comment history from 128 to 152."""
+    _, body = _request(f'{API}/{fid}/revisions'
+                       '?fields=revisions(id,modifiedTime,keepForever)&pageSize=1000'
+                       '&supportsAllDrives=true')
+    revs = json.loads(body).get('revisions', [])
+    pinned, already, failed = [], [], []
+    for r in revs:
+        if r.get('keepForever'):
+            already.append(r['modifiedTime'])
+            continue
+        try:
+            _request(f'{API}/{fid}/revisions/{r["id"]}?supportsAllDrives=true',
+                     method='PATCH', data=json.dumps({'keepForever': True}).encode(),
+                     content_type='application/json')
+            pinned.append(r['modifiedTime'])
+        except SystemExit:
+            failed.append(r['modifiedTime'])
+    # Report what is actually *readable* now, since that is the question being asked.
+    readable = 0
+    for r in revs:
+        try:
+            _request(f'{API}/{fid}/revisions/{r["id"]}?alt=media&supportsAllDrives=true')
+            readable += 1
+        except SystemExit:
+            pass
+    return {'revisions': len(revs), 'newly_pinned': len(pinned),
+            'already_pinned': len(already), 'pin_failed': len(failed),
+            'content_readable': readable,
+            'oldest_pinned': sorted(pinned + already)[0] if (pinned or already) else None}
+
+
+def lost(fid: str) -> dict:
+    """Everything the ledger has ever seen that is not in the most recent pull."""
+    led = load_ledger(fid)
+    if not led.get('pulls'):
+        return {'error': 'no ledger yet for this file; run pull first'}
+    cur = set(led['pulls'][-1]['keys'])
+    gone = [v for k, v in led['comments'].items() if k not in cur]
+    return {'ever_seen': len(led['comments']), 'current': len(cur), 'lost': len(gone),
+            'comments': sorted(({'author': g['author'], 'text': g['text'],
+                                 'anchor': g.get('anchor', ''), 'lastSeen': g.get('lastSeen')}
+                                for g in gone), key=lambda g: (g['author'], g['text']))}
+
+
 def main() -> int:
     if len(sys.argv) < 3:
         print(__doc__.strip().splitlines()[2])
         return 2
     verb, fid = sys.argv[1], sys.argv[2]
+    rest = sys.argv[3:]
     if verb == 'stat':
         print(json.dumps(stat(fid), indent=2))
     elif verb == 'pull':
-        print(json.dumps(pull(fid, sys.argv[3]), indent=2))
+        print(json.dumps(pull(fid, rest[0]), indent=2))
     elif verb == 'push':
-        print(json.dumps(push(fid, sys.argv[3]), indent=2))
+        expect = rest[rest.index('--expect') + 1] if '--expect' in rest else None
+        print(json.dumps(push(fid, rest[0], expect, '--force' in rest), indent=2))
+    elif verb == 'pin':
+        print(json.dumps(pin(fid), indent=2))
+    elif verb == 'lost':
+        print(json.dumps(lost(fid), indent=2))
     else:
-        print(f'unknown verb {verb!r}; use pull, push or stat')
+        print(f'unknown verb {verb!r}; use pull, push, stat, pin or lost')
         return 2
     return 0
 

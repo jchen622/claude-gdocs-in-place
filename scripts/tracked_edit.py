@@ -34,7 +34,7 @@ import xml.etree.ElementTree as ET
 import sys as _sys, pathlib as _pl
 _sys.path.insert(0, str(_pl.Path(__file__).resolve().parent))  # keep `python3 -I` working
 
-from ooxml import W, XS, document, anchor_spans, rewrite
+from ooxml import W, XS, document, anchors_by_paragraph, rewrite
 
 ET.register_namespace('w', 'http://schemas.openxmlformats.org/wordprocessingml/2006/main')
 
@@ -61,7 +61,7 @@ class Editor:
         self.author = author
         self.date = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
         self.nid = _next_id(root)
-        self.anchors = [v for v in anchor_spans(root).values() if v]
+        self.para_anchors = anchors_by_paragraph(root)
 
     def _run(self, rpr, text, dele=False):
         r = ET.Element(W + 'r')
@@ -81,8 +81,6 @@ class Editor:
 
     def apply(self, old: str, new: str, *, insert_only=False) -> str:
         """Returns '' on success or a reason string on refusal."""
-        if old and any(old in a or a in old for a in self.anchors if len(a) > 3):
-            return f'overlaps a comment anchor: {old[:60]!r}'
         for para in self.root.iter(W + 'p'):
             guard = _protected(para)
             for child in list(para):
@@ -91,6 +89,14 @@ class Editor:
                 t = child.find(W + 't')
                 if t is None or old not in (t.text or ''):
                     continue
+                # Anchors are checked here, against this paragraph only. Checking against every
+                # anchor in the document refuses edits that overlap nothing: an anchor on a short
+                # identifier in one paragraph would block that same string everywhere else.
+                # Refuse outright rather than trying the next paragraph, so an anchored first
+                # occurrence can never silently redirect the edit to a different occurrence.
+                for a in self.para_anchors.get(id(para), []):
+                    if len(a) > 3 and (old in a or a in old):
+                        return f'overlaps a comment anchor in this paragraph: {a[:60]!r}'
                 txt = t.text
                 i = txt.index(old)
                 head, tail = txt[:i], txt[i + len(old):]

@@ -89,6 +89,55 @@ def anchor_spans(root: ET.Element) -> dict[str, str]:
     return out
 
 
+def anchors_by_paragraph(root: ET.Element) -> dict[int, list[str]]:
+    """Anchor text per paragraph, keyed by `id(paragraph_element)`.
+
+    `anchor_spans()` answers "what is comment N anchored to". This answers "what is anchored in
+    *this* paragraph", which is what an edit actually needs to know. Checking a match against
+    every anchor in the document over-refuses badly: a comment anchored to a short, repeated
+    string in one paragraph blocks an edit to an identical string anywhere else in the document.
+
+    A comment range may open in one paragraph and close in a later one, so open ranges are
+    carried forward and every paragraph they cross reports its own slice.
+    """
+    out: dict[int, list[str]] = {}
+    carry: set[str] = set()
+    for para in root.iter(W + 'p'):
+        active: dict[str, list[str]] = {cid: [] for cid in carry}
+        done: list[str] = []
+        for el in para.iter():
+            if el.tag == W + 'commentRangeStart':
+                active[el.get(W + 'id')] = []
+            elif el.tag == W + 'commentRangeEnd':
+                chunk = active.pop(el.get(W + 'id'), None)
+                if chunk is not None:
+                    done.append(''.join(chunk))
+            elif el.tag in (W + 't', W + 'delText'):
+                for buf in active.values():
+                    buf.append(el.text or '')
+        done.extend(''.join(buf) for buf in active.values())
+        carry = set(active)
+        out[id(para)] = [s for s in (re.sub(r'\s+', ' ', t).strip() for t in done) if s]
+    return out
+
+
+def comments_extended(path: str) -> dict[str, bool]:
+    """paraId -> resolved flag, from word/commentsExtended.xml.
+
+    The format *can* represent a resolved comment (`w15:done="1"`). Google Docs never writes it:
+    resolving deletes the comment outright, so every surviving entry reads `done="0"`. Read this
+    when you need to prove that, not to find resolved comments, because there will not be any.
+    """
+    z = zipfile.ZipFile(path)
+    name = 'word/commentsExtended.xml'
+    if name not in z.namelist():
+        return {}
+    root = ET.fromstring(z.read(name))
+    w15 = '{http://schemas.microsoft.com/office/word/2012/wordml}'
+    return {e.get(w15 + 'paraId'): e.get(w15 + 'done') == '1'
+            for e in root.iter(w15 + 'commentEx')}
+
+
 def tracked(root: ET.Element) -> dict[str, int]:
     return {'ins': len(list(root.iter(W + 'ins'))), 'del': len(list(root.iter(W + 'del')))}
 

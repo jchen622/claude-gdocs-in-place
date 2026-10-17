@@ -12,6 +12,30 @@ the notifications they send, resolution state, the share list, and every link an
 into Slack, email or another document. Replacing the file destroys all of it, and the text can
 look perfect while it happens.
 
+## Before you start: a document heading into review should be a native Google Doc
+
+**If a document will go through multi-reviewer review where comments get resolved, create it as a
+native Google Doc, not a stored `.docx`.** This is a decision made once, at creation, and it
+cannot be undone cheaply later: converting produces a **new file id**, which is exactly what the
+in-place rule exists to protect.
+
+The reason is measured, not theoretical. On the same Drive account, same org:
+
+| | Stored `.docx` | Native Google Doc |
+|---|---|---|
+| Resolve a comment | **deleted from the file** | kept, `resolved: true` |
+| Author and text afterwards | **stripped** | intact |
+| Replies afterwards | **gone** | intact |
+| Visible in comment history | **no** | yes, permanently |
+
+On a stored `.docx`, resolving is recorded as a *deletion*. Drive's comment layer keeps a
+tombstone row with `author: null` and empty content, and the file loses the comment outright. One
+manuscript lost **68 comments** that way across a single review round, and they were only
+recoverable because Drive still held un-purged revisions.
+
+So: native Doc for anything under review. Reach for this skill's `.docx` tooling when the file is
+already a `.docx` and converting would cost an id people have linked to.
+
 ## Which skill to use, by file type
 
 **This skill handles a stored `.docx` on Drive.** Native Google files are a different thing
@@ -61,6 +85,13 @@ python3 $S/drive_io.py push <file_id> after.docx       # same id, never a new fi
 python3 $S/drive_io.py pull <file_id> check.docx       # confirm it landed
 ```
 
+`push` **refuses by default when Drive has moved since the pull this build came from**, comparing
+against the ledger that `pull` wrote. That guard exists because a push built on a stale pull once
+restored a sentence the author had deleted and resurrected two comments they had resolved, and the
+evidence was already in the output: `previous_modifiedTime` did not match the pull. Pass
+`--expect <modifiedTime>` to pin the base explicitly, or `--force` to override, which should be
+rare and deliberate.
+
 `verify_edit.py` is the gate, not a formality. It fails the push on any of:
 
 1. **comments not identical item by item.** A matching count hides one comment being destroyed
@@ -92,11 +123,16 @@ When you hit either refusal, say so and leave the content alone rather than work
 
 - **Google Docs renumbers comment ids on save.** Ten comments with ids 0,1,2,5,7,11,15,20,21,23
   came back as 0 to 8. Never key anything on comment id. Match on author plus text.
-- **Resolving a comment deletes it** from an exported `.docx`; there is no resolved flag. The
-  live file's comment set *is* the set of open comments, so a drop in count is normal and does
-  not mean something broke.
-- **The Drive comments API returns nothing** for a stored `.docx`, because the comments live in
-  the file's OOXML rather than Drive's comment layer. Read them from `word/comments.xml`.
+- **Resolving a comment deletes it** from a stored `.docx`. There *is* a resolved flag in the
+  format, `w15:done` in `word/commentsExtended.xml`, and Google never writes it: every surviving
+  comment reads `done="0"`. A drop in count is therefore normal and is **not** recoverable from
+  the file. See "Resolved comments are destroyed" below; this is the single most expensive
+  behaviour on this list.
+- **The Drive comments API does work on a stored `.docx`.** An earlier version of this file
+  claimed it returns nothing. It does not: `files/<id>/comments?includeDeleted=true` returns the
+  threads, and it holds **replies that never appear in the OOXML at all**, so archive both
+  sources, not one. What it cannot do is recover anything deleted: deleted comments come back
+  tombstoned, `author: null` and empty `content`.
 - **Docs re-segments runs on save**, so tracked-change counts shift without any content change.
   Compare the accept and reject views, never the raw `w:ins` / `w:del` counts.
 - **Docs wraps suggestions in `w:sdt`**, which is why protected-run detection checks for it.
@@ -110,6 +146,43 @@ When you hit either refusal, say so and leave the content alone rather than work
   status; if you call the API by hand, check it yourself and re-verify on Drive.
 - **Google-native files** (Docs, Sheets, Slides proper) must be exported with
   `/export?mimeType=...`; `alt=media` fails on them. `drive_io.py stat` tells you which you have.
+
+## Resolved comments are destroyed, so capture them before they go
+
+On a stored `.docx` there is no resolved state to read back. The moment a reviewer resolves a
+thread it is gone from the file, and Drive's tombstone keeps no author and no text. **Nothing in
+this tooling causes that**: `rewrite()` replaces `word/document.xml` and copies every other zip
+entry byte-identical, and `verify_edit.py` fails any push whose comment set differs. A drop
+between two pulls is always a human resolving one.
+
+What the tooling does instead is capture:
+
+```bash
+python3 drive_io.py pull <id> out.docx   # archives comments from BOTH sources, every time
+python3 drive_io.py lost <id>            # everything ever seen that is no longer present
+python3 drive_io.py pin  <id>            # stop revision content expiring (do this early)
+```
+
+`pull` folds every comment it sees into an append-only ledger (`~/.gdocs-in-place/ledger/<id>.json`,
+override with `GDOCS_LEDGER_DIR`) and prints `resolved_since_last_pull` when something has gone.
+**Pull often while a document is under review**: a comment resolved between two pulls was never
+captured, and the ledger narrows that window rather than closing it.
+
+**`pin` is the part people skip, and it does more than it looks like it does.** Revision history
+is the only way back to a resolved comment, so pin at the start of a review rather than when
+something is already missing.
+
+**A 403 on an old revision does not mean the content is gone.** Downloading an unpinned revision
+older than about 30 days returns `HTTP 403`, which reads exactly like a purge. It is not: setting
+`keepForever` on that same revision makes it download fine. Drive is gating access, not deleting
+bytes. On the manuscript this skill came from, 32 revisions returned 403, and pinning brought all
+of them back, which took the recoverable history from 128 comments to **152** and the author's own
+recovered replies from 3 to 8. So **always `pin` before concluding anything is unrecoverable**,
+and never read a 403 as proof of loss.
+
+One thing that genuinely is not recoverable, worth saying out loud rather than discovering later:
+**a reply written and resolved inside one editing session**. Drive snapshots on autosave
+boundaries, so it never existed at a snapshot point and no amount of pinning will produce it.
 
 ## Before you push, ask
 

@@ -21,7 +21,7 @@ from being erased.
 
 | Script | Purpose |
 |---|---|
-| `drive_io.py` | pull, push and stat by file id, never creating a new file |
+| `drive_io.py` | pull, push, stat, pin and lost by file id, never creating a new file |
 | `ooxml.py` | read a `.docx`'s accept / reject / raw views, comments and anchor spans |
 | `tracked_edit.py` | apply `w:del`/`w:ins` tracked changes by text match, splitting runs and preserving formatting |
 | `verify_edit.py` | the pre-push gate |
@@ -48,6 +48,33 @@ from being erased.
   on.
 
 Both destroy other people's work in ways that are invisible afterwards, so neither is a warning.
+
+### Resolved comments
+
+On a stored `.docx`, resolving a comment **deletes** it. The OOXML resolved flag
+(`w15:done="1"`) exists but Google never writes it, and Drive's comment layer keeps only a
+tombstone with the author and text stripped. One manuscript lost 68 comments this way in a single
+review round.
+
+Nothing in this tooling causes that: `rewrite()` touches only `word/document.xml`, and the gate
+fails any push whose comment set differs. So the tooling captures instead. `pull` folds every
+comment it sees, from the file *and* from Drive's comment layer, into an append-only ledger and
+reports anything that has disappeared since the previous pull. `pin` sets `keepForever` on the
+file's revisions, because revision history is the only route back to a resolved comment.
+
+Pinning also *restores access*: an unpinned revision older than about 30 days returns `HTTP 403`
+on download, which looks exactly like a purge and is not one. Pin it and the same revision reads
+fine. On the document this was built for, pinning took the recoverable comment history from 128
+to 152. **Never treat a 403 on an old revision as proof the content is gone.**
+
+**The real fix is upstream:** a document heading into multi-reviewer review should be created as
+a **native Google Doc**, which retains resolved comments in full, with their replies, permanently.
+Converting later is not equivalent, because it mints a new file id.
+
+### Staleness
+
+`push` refuses when Drive has moved since the pull the build came from. A push built on a stale
+pull once restored a deleted sentence and resurrected two resolved comments.
 
 ## Usage
 

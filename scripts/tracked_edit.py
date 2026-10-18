@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import copy
 import datetime
+import re
 import sys
 import xml.etree.ElementTree as ET
 
@@ -62,6 +63,9 @@ class Editor:
         self.date = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
         self.nid = _next_id(root)
         self.para_anchors = anchors_by_paragraph(root)
+        # ElementTree has no parent pointers; build one so a paragraph can be
+        # inserted next to its sibling.
+        self.parents = {id(c): parent for parent in root.iter() for c in parent}
 
     def _run(self, rpr, text, dele=False):
         r = ET.Element(W + 'r')
@@ -78,6 +82,49 @@ class Editor:
                                  W + 'author': self.author, W + 'date': self.date})
         w.append(self._run(rpr, text, dele))
         return w
+
+    def new_paragraph(self, anchor: str, text: str) -> str:
+        """Add a whole new paragraph after the one containing `anchor`.
+
+        The paragraph mark itself is marked inserted, via `w:pPr/w:rPr/w:ins`. Without that the
+        runs disappear on reject but the empty paragraph stays behind, which breaks the
+        reject-view-byte-identical invariant and leaves a blank line in the reviewer's copy.
+        """
+        for para in self.root.iter(W + 'p'):
+            if anchor not in ''.join(t.text or '' for t in para.iter(W + 't')):
+                continue
+            for a in self.para_anchors.get(id(para), []):
+                if len(a) > 3 and (anchor in a or a in anchor):
+                    return f'anchor paragraph carries a comment: {a[:60]!r}'
+            parent = self.parents.get(id(para))
+            if parent is None:
+                return 'could not find the parent of the anchor paragraph'
+
+            self.nid += 1
+            np = ET.Element(W + 'p')
+            src_pPr = para.find(W + 'pPr')
+            pPr = copy.deepcopy(src_pPr) if src_pPr is not None else ET.Element(W + 'pPr')
+            for child in list(pPr):                      # drop any inherited change marking
+                if child.tag in (W + 'rPr',):
+                    pPr.remove(child)
+            rPr = ET.SubElement(pPr, W + 'rPr')
+            ET.SubElement(rPr, W + 'ins', {W + 'id': str(self.nid), W + 'author': self.author,
+                                           W + 'date': self.date})
+            np.append(pPr)
+
+            for i, seg in enumerate(re.split(r'\*([^*]+)\*', text)):
+                if not seg:
+                    continue
+                rpr = None
+                if i % 2:                                 # odd segments were *wrapped*
+                    rpr = ET.Element(W + 'rPr')
+                    ET.SubElement(rpr, W + 'i')
+                np.append(self._wrap('ins', rpr, seg))
+
+            idx = list(parent).index(para)
+            parent.insert(idx + 1, np)
+            return ''
+        return f'no paragraph contains {anchor[:60]!r}'
 
     def apply(self, old: str, new: str, *, insert_only=False) -> str:
         """Returns '' on success or a reason string on refusal."""
@@ -129,6 +176,12 @@ def main() -> int:
     ap.add_argument('--replace', nargs=2, action='append', metavar=('OLD', 'NEW'), default=[])
     ap.add_argument('--insert-after', nargs=2, action='append',
                     metavar=('ANCHOR', 'TEXT'), default=[])
+    ap.add_argument('--new-paragraph-after', nargs=2, action='append',
+                    metavar=('ANCHOR', 'TEXT'), default=[],
+                    help='add a whole new paragraph after the one containing ANCHOR, copying '
+                         'its paragraph properties. Wrap italic spans in *asterisks*. Needed '
+                         'for things like a reference-list entry, which --insert-after cannot '
+                         'do because it can only add text inside an existing paragraph.')
     a = ap.parse_args()
 
     root = document(a.src)
@@ -144,6 +197,13 @@ def main() -> int:
         print(f'  {"ok  " if not why else "FAIL"}  insert after {anchor[:40]!r}' + (f'  <- {why}' if why else ''))
         if why:
             problems.append(why)
+    for anchor, text in a.new_paragraph_after:
+        why = ed.new_paragraph(anchor, text)
+        print(f'  {"ok  " if not why else "FAIL"}  new paragraph after {anchor[:36]!r}'
+              + (f'  <- {why}' if why else ''))
+        if why:
+            problems.append(why)
+
     if problems:
         print(f'\n{len(problems)} edit(s) refused; nothing written. '
               'Fix the match text, or leave the protected content alone.')

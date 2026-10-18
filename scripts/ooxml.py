@@ -56,6 +56,40 @@ def paragraphs(root: ET.Element, mode: str = 'accept') -> list[str]:
     return out
 
 
+def paragraphs_spaced(root: ET.Element, mode: str = 'accept') -> list[str]:
+    """Like `paragraphs()`, but **without collapsing whitespace**.
+
+    `paragraphs()` normalises runs of whitespace so that comparisons survive Google Docs
+    re-segmenting runs on save. That normalisation also destroys the evidence of a double space,
+    which made a double-space check built on it incapable of ever firing. Use this when the
+    spacing itself is what you are inspecting, and `paragraphs()` for everything else.
+    """
+    out = []
+    for para in root.iter(W + 'p'):
+        buf: list[str] = []
+
+        def walk(node, ins=False, dele=False):
+            for ch in node:
+                if ch.tag == W + 'ins':
+                    walk(ch, True, dele)
+                elif ch.tag == W + 'del':
+                    walk(ch, ins, True)
+                elif ch.tag in (W + 't', W + 'delText'):
+                    t = ch.text or ''
+                    if mode == 'raw':
+                        buf.append(t)
+                    elif mode == 'accept' and not dele:
+                        buf.append(t)
+                    elif mode == 'reject' and not ins:
+                        buf.append(t)
+                else:
+                    walk(ch, ins, dele)
+
+        walk(para)
+        out.append(''.join(buf))
+    return out
+
+
 def comments(path: str) -> list[tuple[str, str]]:
     """(author, text) per comment. Keyed on text, never on id: Docs renumbers ids on save."""
     z = zipfile.ZipFile(path)

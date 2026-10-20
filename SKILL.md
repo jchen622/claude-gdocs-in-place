@@ -5,6 +5,27 @@ description: Edit a stored .docx on Google Drive in place on its existing file i
 
 # Editing Drive files in place
 
+## Setup, first run
+
+Python 3 and its standard library, nothing to install. The one requirement is a Drive-scoped
+gcloud login:
+
+```bash
+gcloud auth login --enable-gdrive-access
+python3 -I scripts/drive_io.py stat <file_id>     # confirms the token reaches Drive
+```
+
+Without `--enable-gdrive-access` every call fails with `could not get an access token`, or
+returns 403 on a file id that is perfectly valid. Tokens last about an hour.
+
+Shared Drive files need nothing extra: every request already sends `supportsAllDrives=true`.
+
+After changing anything under `scripts/`, run the suite:
+
+```bash
+python3 -I tests/guards_test.py
+```
+
 **Never replace a Drive file with a regenerated copy. Always write to the existing file id.**
 
 The id carries everything that is not text: comment threads and their replies, @-mentions and
@@ -73,7 +94,14 @@ than inside the file. Each has its own working path, already built:
 | Native Google Sheets | **`gsheets`** (Sheets API) | values and ranges, not OOXML |
 | Native Google Doc | **`gdocs`** | Docs API, not OOXML |
 
-`drive_io.py` will refuse a native file rather than let you treat it as an archive.
+Those three are separate skills and are **not installed by this one**. If you do not have them,
+treat the rows above as "this skill is the wrong tool" rather than as a working alternative: the
+important half is that a native file must not be pushed as OOXML, not which skill you reach for
+instead.
+
+`drive_io.py` refuses a native file on both sides. `pull` will not hand you one to treat as an
+archive, and `push` checks the target's own `mimeType` before uploading, so a `.docx` cannot be
+PATCHed onto a native Doc or a `.pptx` onto a `.docx` id.
 
 All of them edit in place on the existing id. **The rule below is Drive-wide; only the tooling
 in this skill is `.docx`-specific.**
@@ -128,20 +156,41 @@ rare and deliberate.
 4. **more paragraphs changed than expected**, so an edit meant for one sentence has not quietly
    rewritten five.
 
-## Two things the tooling refuses to do
+## What the tooling refuses to do
 
-Both are failures that write nothing, because both destroy other people's work in ways that are
-invisible afterwards.
+Every one of these is a failure that writes nothing, because each destroys work in a way that is
+invisible afterwards. All are covered by `tests/guards_test.py`.
 
 **It will not edit inside another person's pending tracked change or Google Docs suggestion.**
 Rewriting over a suggestion strips their authorship from the revision record. If a reviewer's
 correction needs repositioning, accept it first, then move the settled text. Better word order is
-not worth erasing who caught the problem.
+not worth erasing who caught the problem. This covers a `w:ins` or `w:del` around the run, a
+block-level `w:sdt` wrapping the whole paragraph, and a pending change on the paragraph *mark*
+in `w:pPr/w:rPr`, which no scan of the text can see.
 
 **It will not edit text a comment is anchored to.** Deleting an anchor breaks the thread, often
-one the reviewer is waiting on an answer to.
+one the reviewer is waiting on an answer to. The check is positional: the character range of the
+edit is compared against the character range of each anchor in that paragraph. Comparing the
+strings instead both over-refuses, blocking an unanchored copy of an anchored word elsewhere in
+the paragraph, and under-refuses, since a short anchor was skipped by a length test.
 
-When you hit either refusal, say so and leave the content alone rather than working around it.
+**It will not guess between several matches.** If the text appears more than once, the run stops
+and lists the candidates rather than editing the first one. Pass `--occurrence N` to choose, or
+give more surrounding text. Silently taking the first match is how an edit lands in the wrong
+section while `--expect-changed 1` still reports success.
+
+**It will not split a run that holds more than plain text.** A run can carry a tab, a line break,
+a field, a footnote reference or an image alongside its text. Rebuilding such a run from its
+`w:t` alone drops those, and a text-level check cannot see it happen: one run reading
+`See⟶Table 1` came back as `Refer toSee`, with both the tab and "Table 1" gone.
+
+**It will not take an empty `OLD` or `ANCHOR`.** An empty string matches at the start of the
+first run, so it would insert at the top of the document rather than where you meant.
+
+**It will not write its output over its own input.** `rewrite(src, dst)` with the same path
+truncates the file while the zip is still being read from it.
+
+When you hit a refusal, say so and leave the content alone rather than working around it.
 
 ## Platform behaviour that will cost you time
 

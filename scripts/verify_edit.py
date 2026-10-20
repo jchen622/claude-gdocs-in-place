@@ -10,11 +10,17 @@ they matter:
                      one comment being destroyed while another is resurrected.
   2. anchor spans    unchanged. A disturbed anchor silently widens, usually to the whole
                      paragraph, and the reviewer loses the phrase they actually marked.
-  3. reject view     byte-identical. This is the strongest single check: it proves the edit only
-                     *proposed* changes and did not alter settled text. If it fails, whoever
-                     rejects your change will not get back what they had.
-  4. accept view     exactly the expected number of paragraphs changed, so an edit intended to
-                     touch one sentence has not quietly rewritten five.
+  3. reject view     unchanged, whitespace and empty paragraphs included. This is the strongest
+                     single check: it proves the edit only *proposed* changes and did not alter
+                     settled text. If it fails, whoever rejects your change will not get back
+                     what they had.
+  4. run content     tabs, breaks, fields, footnote references and images still all present.
+                     Text comparison cannot see these, and splitting a run is exactly what
+                     drops them.
+  5. accept view     exactly the expected number of paragraphs changed, so an edit intended to
+                     touch one sentence has not quietly rewritten five. Paragraphs are aligned
+                     by content, so one insertion near the top does not mark every later
+                     paragraph as changed.
 
 A clean run means the edit is safe to PATCH onto the live file id.
 """
@@ -29,6 +35,16 @@ import sys as _sys, pathlib as _pl
 _sys.path.insert(0, str(_pl.Path(__file__).resolve().parent))  # keep `python3 -I` working
 
 from ooxml import document, paragraphs, paragraphs_spaced, comments, anchor_spans, tracked
+
+W = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+# Run children carrying content that no text view reports.
+_CONTENT = ('tab', 'br', 'drawing', 'pict', 'sym', 'object', 'fldChar', 'instrText',
+            'footnoteReference', 'endnoteReference', 'ptab', 'softHyphen', 'noBreakHyphen')
+
+
+def _content_marks(root) -> dict[str, int]:
+    return {name: n for name in _CONTENT
+            if (n := len(list(root.iter(W + name))))}
 
 # Damage that checks 1 to 4 cannot see, because it disturbs nothing structural: the edit lands
 # where it should and still produces broken prose. Every one of these was observed on a real
@@ -100,17 +116,34 @@ def main() -> int:
         for x in [s for s in sb if s not in sa][:5]:
             print(f'          was anchored on: {x[:80]!r}')
 
-    jb, ja = paragraphs(rb, 'reject'), paragraphs(ra, 'reject')
+    # Compared without collapsing whitespace and without dropping empty paragraphs. The
+    # normalising `paragraphs()` view was reporting "byte-identical" while a lost tab, line
+    # break or blank paragraph went straight through it, which is precisely the damage a run
+    # split causes. Keep this strict; it is the check the whole tool rests on.
+    jb, ja = paragraphs_spaced(rb, 'reject'), paragraphs_spaced(ra, 'reject')
     if jb == ja:
-        print('  ok    reject view byte-identical (settled text untouched)')
+        print(f'  ok    reject view unchanged, whitespace included ({len(jb)} paragraphs)')
     else:
         fails.append('reject view changed')
-        print(f'  FAIL  reject view differs in {sum(1 for x, y in zip(jb, ja) if x != y)} paragraph(s)')
+        n = sum(1 for x, y in zip(jb, ja) if x != y) + abs(len(jb) - len(ja))
+        print(f'  FAIL  reject view differs in {n} paragraph(s)')
         for x, y in zip(jb, ja):
             if x != y:
-                print(f'          before: {x[:110]}')
-                print(f'          after : {y[:110]}')
+                print(f'          before: {x[:110]!r}')
+                print(f'          after : {y[:110]!r}')
                 break
+
+    # Run-level content no text view can see. A run split that rebuilds only `w:t` drops these
+    # silently, so count them: text comparison alone cannot tell you a tab is gone.
+    cb, ca = _content_marks(rb), _content_marks(ra)
+    if cb == ca:
+        print(f'  ok    run content preserved ({sum(cb.values())} tabs/breaks/fields/images)')
+    else:
+        fails.append('run content changed')
+        print('  FAIL  run-level content lost or added')
+        for k in sorted(set(cb) | set(ca)):
+            if cb.get(k, 0) != ca.get(k, 0):
+                print(f'          w:{k}: {cb.get(k, 0)} -> {ca.get(k, 0)}')
 
     ab, aa = paragraphs(rb, 'accept'), paragraphs(ra, 'accept')
     # Align by content so an inserted or removed paragraph does not make every later one look

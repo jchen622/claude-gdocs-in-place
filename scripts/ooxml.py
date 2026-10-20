@@ -14,12 +14,18 @@ a change, and whoever rejects your edit will not get back what they had.
 """
 from __future__ import annotations
 
+import os
 import re
 import zipfile
 import xml.etree.ElementTree as ET
 
 W = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
 XS = '{http://www.w3.org/XML/1998/namespace}space'
+
+# The first start tag in the document, with its attributes. Anchored on the first `<` that
+# begins an element rather than `<?xml ...?>` or a comment, so the XML declaration is skipped.
+_ROOT_TAG = re.compile(rb'<([A-Za-z_][\w:.\-]*)((?:[^>"\']|"[^"]*"|\'[^\']*\')*?)\s*/?>')
+_DECL = re.compile(r'xmlns(?::([A-Za-z_][\w.\-]*))?\s*=\s*"([^"]*)"')
 
 
 def document(path: str) -> ET.Element:
@@ -176,10 +182,65 @@ def tracked(root: ET.Element) -> dict[str, int]:
     return {'ins': len(list(root.iter(W + 'ins'))), 'del': len(list(root.iter(W + 'del')))}
 
 
+def root_declarations(xml: bytes) -> dict[str, str]:
+    """prefix -> URI for every namespace declared on the root element. `''` is the default.
+
+    Read off the raw bytes rather than the parsed tree on purpose: ElementTree discards the
+    prefixes and keeps only the URIs, so by the time you hold an Element the information this
+    returns is already gone.
+    """
+    m = _ROOT_TAG.search(xml)
+    if not m:
+        return {}
+    return {(p or ''): u for p, u in _DECL.findall(m.group(2).decode('utf-8', 'replace'))}
+
+
+def _restore_declarations(blob: bytes, original: dict[str, str]) -> bytes:
+    """Put back every root namespace declaration ElementTree dropped on the way out.
+
+    ET only emits a declaration for a namespace it sees *used* on an element or attribute name.
+    A prefix that appears solely inside an attribute **value** is invisible to it, and
+    `mc:Ignorable="w14 w15 wp14"` is exactly that: it names prefixes without using them. Word
+    reads such a file as corrupt, because `Ignorable` points at prefixes nothing declares.
+    Re-adding the originals also keeps the header stable for anything diffing the XML.
+    """
+    m = _ROOT_TAG.search(blob)
+    if not m:
+        return blob
+    present = {p or '' for p, _ in _DECL.findall(m.group(2).decode('utf-8', 'replace'))}
+    missing = [(p, u) for p, u in original.items() if p not in present]
+    if not missing:
+        return blob
+    add = ''.join(f' xmlns{":" + p if p else ""}="{u}"' for p, u in missing).encode()
+    end = m.end(2)
+    return blob[:end] + add + blob[end:]
+
+
 def rewrite(src: str, dst: str, root: ET.Element) -> None:
-    """Write `root` back into a copy of `src`, leaving every other zip entry byte-identical."""
-    blob = ET.tostring(root, encoding='utf-8', xml_declaration=True)
+    """Write `root` back into a copy of `src`, leaving every other zip entry byte-identical.
+
+    Namespace prefixes are preserved. Without that, `mc`, `w14`, `w15`, `wp14` and `r` come back
+    out as `ns0`, `ns1` and so on, and Word refuses the file. A text-level check cannot see this,
+    so it has to be right here rather than caught downstream.
+    """
+    if os.path.exists(dst) and os.path.exists(src) and os.path.samefile(src, dst):
+        raise ValueError(
+            f'rewrite() cannot write to its own source ({src}): the zip is still being read '
+            'from it, so the output would truncate the input. Write to a new path, then move.')
+
     zin = zipfile.ZipFile(src)
+    original = zin.read('word/document.xml')
+
+    # Teach ET the document's own prefixes before serialising. This is process-global state,
+    # which is acceptable here: every caller is editing one OOXML document per run, and these
+    # URI-to-prefix pairs are fixed by the format rather than per-document.
+    for prefix, uri in root_declarations(original).items():
+        if prefix:
+            ET.register_namespace(prefix, uri)
+
+    blob = ET.tostring(root, encoding='utf-8', xml_declaration=True)
+    blob = _restore_declarations(blob, root_declarations(original))
+
     with zipfile.ZipFile(dst, 'w', zipfile.ZIP_DEFLATED) as zout:
         for item in zin.infolist():
             zout.writestr(item, blob if item.filename == 'word/document.xml'

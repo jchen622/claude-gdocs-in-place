@@ -57,14 +57,28 @@ LEDGER_DIR = pathlib.Path(
     os.environ.get('GDOCS_LEDGER_DIR', pathlib.Path.home() / '.gdocs-in-place' / 'ledger'))
 
 
+_TOKEN: str | None = None
+
+
 def token() -> str:
-    """Fresh access token. Re-run per invocation; these expire in about an hour."""
+    """Access token, fetched once per process.
+
+    These last about an hour and no single run comes close, so fetching per request spawned a
+    `gcloud` subprocess every time for nothing. A push that pins revisions makes a dozen calls.
+    """
+    global _TOKEN
+    if _TOKEN:
+        return _TOKEN
     out = subprocess.run(['gcloud', 'auth', 'print-access-token'],
                          capture_output=True, text=True)
     tok = out.stdout.strip()
     if out.returncode != 0 or not tok or ' ' in tok:
-        raise SystemExit(f'could not get an access token: {out.stderr.strip()[:200]}')
-    return tok
+        raise SystemExit(
+            f'could not get an access token: {out.stderr.strip()[:200]}\n'
+            'First run on this machine? Authenticate with:\n'
+            '  gcloud auth login --enable-gdrive-access')
+    _TOKEN = tok
+    return _TOKEN
 
 
 def _request(url: str, *, method='GET', data=None, content_type=None):
@@ -289,7 +303,23 @@ def push(fid: str, path: str, expect: str | None = None, force: bool = False) ->
                 f'(last edited by {(before.get("lastModifyingUser") or {}).get("displayName","?")})\n'
                 'Pushing would revert their edits. Discard this build, pull again, redo the edit.\n'
                 'Override with --force only if you are certain nothing was lost.')
+    # The target's own type decides what may be written to it. Taking Content-Type from the
+    # local extension alone let a .docx be PATCHed onto a native Doc, or a .pptx onto a .docx
+    # id: both succeed at the HTTP level and leave a file nothing can open. `pull` already
+    # refuses native files, but nothing stopped a push reaching one by a different route.
+    remote = before.get('mimeType')
+    if remote in NATIVE:
+        raise SystemExit(
+            f'REFUSING TO PUSH: {fid} is a Google-native file ({remote}).\n'
+            'Native files have no .docx to replace. Use the Docs/Slides API, or the gdocs '
+            'or gslides skill.')
     ctype = PPTX if path.endswith('.pptx') else DOCX
+    if remote and remote != ctype:
+        raise SystemExit(
+            f'REFUSING TO PUSH: type mismatch.\n'
+            f'  local file  : {path} -> {ctype}\n'
+            f'  Drive target: {fid} -> {remote}\n'
+            'Pushing would overwrite one format with another. Check the file id.')
     with open(path, 'rb') as fh:
         blob = fh.read()
     url = (f'{UPLOAD}/{fid}?uploadType=media&supportsAllDrives=true'
